@@ -1,0 +1,4 @@
+/target
+/ffmpeg-dev
+/models
+.cargo/config.toml
