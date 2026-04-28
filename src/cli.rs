@@ -89,6 +89,18 @@ pub enum Command {
         /// Maximum number of important sections to extract
         #[arg(long, default_value = "5")]
         max_segments: usize,
+
+        /// Maximum duration in seconds for each segment
+        #[arg(long, default_value = "10")]
+        max_duration: f64,
+
+        /// Crop output to 9:16 portrait (1080x1920) with face tracking
+        #[arg(long, default_value_t = false)]
+        crop_mobile: bool,
+
+        /// Path to rustface model file (seeta_fd_frontal_v1.0.bin). Required when --crop-mobile is set.
+        #[arg(long)]
+        face_model: Option<PathBuf>,
     },
 
     /// Extract speech from video and produce a text transcript and SRT subtitles

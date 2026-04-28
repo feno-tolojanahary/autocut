@@ -1,3 +1,4 @@
+pub mod crop;
 pub mod engine;
 pub mod llm;
 pub mod operations;

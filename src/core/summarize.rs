@@ -3,6 +3,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use super::crop;
 use super::engine;
 use super::llm;
 use super::transcribe;
@@ -17,6 +18,9 @@ pub fn run(
     llm_model: &str,
     language: Option<&str>,
     max_segments: usize,
+    max_duration: f64,
+    crop_mobile: bool,
+    face_model: Option<&Path>,
 ) -> Result<()> {
     validate_input(input)?;
 
@@ -25,6 +29,13 @@ pub fn run(
             "whisper model file does not exist: {}",
             whisper_model.display()
         );
+    }
+
+    if crop_mobile {
+        let fm = face_model.context("--face-model is required when --crop-mobile is set")?;
+        if !fm.exists() {
+            bail!("face model file does not exist: {}", fm.display());
+        }
     }
 
     // Check Ollama connectivity and model availability early.
@@ -76,6 +87,17 @@ pub fn run(
     for s in &sections {
         println!("  {:.1}s - {:.1}s: {}", s.start_secs, s.end_secs, s.reason);
     }
+
+    // Clamp each section to max_duration, keeping the start and trimming the end.
+    let sections: Vec<_> = sections
+        .into_iter()
+        .map(|mut s| {
+            if s.end_secs - s.start_secs > max_duration {
+                s.end_secs = s.start_secs + max_duration;
+            }
+            s
+        })
+        .collect();
 
     // Step 4: Render each segment as a separate file
     println!("[clip-cli] Step 4/4: Rendering {} summary segment(s)...", sections.len());
@@ -134,6 +156,12 @@ pub fn run(
         (total_duration / duration) * 100.0,
     );
     println!("[clip-cli] Combined video → {}", output.display());
+
+    if crop_mobile {
+        let mobile_path = parent.join(format!("{stem}_mobile.{ext}"));
+        crop::crop_mobile(output, &mobile_path, face_model.unwrap())?;
+        println!("[clip-cli] Combined mobile crop → {}", mobile_path.display());
+    }
 
     Ok(())
 }

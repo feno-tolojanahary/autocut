@@ -76,6 +76,9 @@ fn main() -> Result<()> {
             llm_model,
             language,
             max_segments,
+            max_duration,
+            crop_mobile,
+            face_model,
         } => {
             crate::core::summarize::run(
                 &input,
@@ -84,6 +87,9 @@ fn main() -> Result<()> {
                 &llm_model,
                 language.as_deref(),
                 max_segments,
+                max_duration,
+                crop_mobile,
+                face_model.as_deref(),
             )?;
 
         }

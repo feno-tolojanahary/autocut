@@ -42,9 +42,18 @@ pub fn render(timeline: &Timeline, output: &Path) -> Result<()> {
 
     // Track cumulative duration offsets across clips for multi-clip timelines.
     let mut cumulative_offsets: Vec<i64> = vec![0; nb_streams];
+    // Track the maximum DTS written per stream across all clips to guarantee
+    // monotonically increasing DTS even across clip boundaries with B-frames.
+    let mut max_dts_written: Vec<i64> = vec![-1; nb_streams];
 
     for clip in &timeline.clips {
-        let last_dts = write_clip(&mut output_ctx, clip, &stream_mapping, &cumulative_offsets)?;
+        let last_dts = write_clip(
+            &mut output_ctx,
+            clip,
+            &stream_mapping,
+            &cumulative_offsets,
+            &mut max_dts_written,
+        )?;
         // Advance cumulative offsets by the last DTS seen in each stream + 1.
         for i in 0..nb_streams {
             if last_dts[i] > 0 {
@@ -65,6 +74,7 @@ fn write_clip(
     clip: &super::types::Clip,
     stream_mapping: &[usize],
     cumulative_offsets: &[i64],
+    max_dts_written: &mut [i64],
 ) -> Result<Vec<i64>> {
     let mut input_ctx = ffmpeg::format::input(&clip.source)
         .with_context(|| format!("failed to open: {}", clip.source.display()))?;
@@ -75,12 +85,16 @@ fn write_clip(
     // Seek to the start position. Use backward seek to land on a keyframe before start.
     input_ctx.seek(start_ts, ..start_ts)?;
 
-    // Per-stream: the first DTS seen (used to normalize timestamps to 0).
-    let mut first_dts: Vec<Option<i64>> = vec![None; nb_streams];
     // Per-stream: the last DTS written (returned to caller for multi-clip offset tracking).
     let mut last_dts: Vec<i64> = vec![0; nb_streams];
     // Per-stream: whether we've seen a packet past end_secs.
     let mut stream_done: Vec<bool> = vec![false; nb_streams];
+    // Whether we've seen a video keyframe at or before start_secs (needed for clean decoding).
+    let mut seen_video_keyframe = false;
+    // The real-world time (seconds) used as a common reference for all streams.
+    // Set to the first video keyframe time so video starts at DTS=0 and audio
+    // is offset by the same amount, keeping them in sync.
+    let mut reference_secs: Option<f64> = None;
 
     for (stream, packet) in input_ctx.packets() {
         let stream_idx = stream.index();
@@ -94,8 +108,30 @@ fn write_clip(
         let pts = packet.pts().unwrap_or(packet.dts().unwrap_or(0));
         let pkt_time = pts as f64 * f64::from(time_base.0) / f64::from(time_base.1);
 
-        // Skip packets before start (from keyframe seek overshoot).
-        if pkt_time < clip.start_secs - 0.5 {
+        let is_video = stream.parameters().medium() == ffmpeg::media::Type::Video;
+
+        // For the video stream, we must start from a keyframe to avoid corruption.
+        // Skip all video packets until we find a keyframe, then include it even if
+        // it's slightly before start_secs.
+        if is_video && !seen_video_keyframe {
+            if packet.is_key() && pkt_time <= clip.start_secs {
+                seen_video_keyframe = true;
+                // Use this keyframe's time as the sync reference for all streams.
+                reference_secs = Some(pkt_time);
+            } else if packet.is_key() && pkt_time > clip.start_secs {
+                // Keyframe is past start — use it anyway (no earlier keyframe available).
+                seen_video_keyframe = true;
+                reference_secs = Some(pkt_time);
+            } else {
+                // Non-keyframe before we found our keyframe — skip it.
+                continue;
+            }
+        }
+
+        // For non-video streams (audio), skip packets before the reference time.
+        // This ensures audio starts at the same real-world time as the video keyframe.
+        let ref_secs = reference_secs.unwrap_or(clip.start_secs);
+        if !is_video && pkt_time < ref_secs - 0.05 {
             continue;
         }
 
@@ -114,24 +150,34 @@ fn write_clip(
         let mut out_packet = packet.clone();
         out_packet.set_stream(out_stream_idx);
 
+        // Compute the base DTS for this stream from the common reference time.
+        // Converting the same real-world time to each stream's output time base
+        // ensures audio and video are normalized by the same offset.
+        let base_dts = (ref_secs * f64::from(out_time_base.1) / f64::from(out_time_base.0)) as i64;
+
         // Rescale timestamps from input to output time base.
         out_packet.rescale_ts(time_base, out_time_base);
 
-        // Record the first DTS for this stream to normalize timestamps.
-        if first_dts[stream_idx].is_none() {
-            first_dts[stream_idx] = out_packet.dts();
-        }
+        // Shift timestamps: normalize relative to clip start then add cumulative offset.
+        // Enforce strictly increasing DTS to avoid muxer errors with B-frame reordering.
+        if let Some(dts) = out_packet.dts() {
+            let mut new_dts = (dts - base_dts + cumulative_offsets[stream_idx]).max(0);
+            if new_dts <= max_dts_written[stream_idx] {
+                new_dts = max_dts_written[stream_idx] + 1;
+            }
+            let dts_shift = new_dts - (dts - base_dts + cumulative_offsets[stream_idx]);
+            out_packet.set_dts(Some(new_dts));
+            max_dts_written[stream_idx] = new_dts;
+            last_dts[stream_idx] = new_dts;
 
-        // Shift timestamps: normalize to 0 then add cumulative offset.
-        if let Some(base_dts) = first_dts[stream_idx] {
-            if let Some(dts) = out_packet.dts() {
-                let new_dts = dts - base_dts + cumulative_offsets[stream_idx];
-                out_packet.set_dts(Some(new_dts));
-                last_dts[stream_idx] = new_dts;
-            }
+            // Apply the same shift to PTS to preserve the PTS-DTS delta (B-frame ordering).
             if let Some(pts) = out_packet.pts() {
-                out_packet.set_pts(Some(pts - base_dts + cumulative_offsets[stream_idx]));
+                let new_pts = (pts - base_dts + cumulative_offsets[stream_idx] + dts_shift).max(new_dts);
+                out_packet.set_pts(Some(new_pts));
             }
+        } else if let Some(pts) = out_packet.pts() {
+            let new_pts = (pts - base_dts + cumulative_offsets[stream_idx]).max(0);
+            out_packet.set_pts(Some(new_pts));
         }
 
         out_packet.set_position(-1);
